@@ -1,4 +1,4 @@
-# N8NCTL
+# n8nctl
 
 **Standalone control script for a lone n8n Docker container**
 Environment: Kali/Parrot Linux (Docker CLI) · Project path: `~/n8n-project` (flat, single folder)
@@ -70,6 +70,8 @@ Auto-sourced at startup, before flags are parsed. **Precedence:** flags > enviro
 ```bash
 chmod +x n8nctl
 ```
+
+> **Note:** if your user account doesn't have permission to run Docker directly (not in the `docker` group) or hits permission errors on `chmod`/file operations, prefix the command with `sudo`, e.g. `sudo ./n8nctl start` or `sudo chmod +x n8nctl`. This applies to any command in this doc that returns a "permission denied" error.
 
 ---
 
@@ -174,6 +176,8 @@ docker exec n8n cat /etc/hosts | grep host.docker.internal
 ---
 
 ## Connecting n8n to the host machine via SSH
+
+Full risk analysis lives in `07-n8n-to-host-communication.md` §4 — read it before enabling this beyond testing, particularly the `docker`-group root-equivalence warning.
 
 **Why `localhost` doesn't work:** `-p` publishes container → host, for things *outside* Docker to reach *in*. It has no effect on what `localhost` resolves to *inside* the container — that's always the container's own loopback. An SSH node pointed at `localhost` reaches port 22 inside the n8n container itself, not the host.
 
@@ -373,3 +377,11 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:5678/healthz
 - `restore` refuses to run without `--file`
 - `remove --data` is gated behind a typed `yes` — data survives on any other input
 - Host-access mismatch detection tested against three scenarios (no mapping + access requested; mapping present + already correct; mapping present + `--no-host-access` requested) — recreates only when needed
+
+---
+
+## See also
+
+- `07-n8n-to-host-communication.md` — SSH vs. HTTP Request trade-off analysis for reaching the host
+- `05-n8nkali — Installing on $PATH` — shared path-resolution logic
+- `04-Updating n8n & the pentest Script Usage Guide` — the parent `n8nkali` script this is a standalone counterpart to
