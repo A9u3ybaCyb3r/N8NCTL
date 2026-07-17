@@ -1,0 +1,651 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────
+# n8nctl — standalone control script for a lone n8n Docker container
+#
+# No Kali/Parrot tooling container involved here — this is for when
+# you want n8n running by itself and reach analysis tools on the HOST
+# machine instead (SSH node or HTTP Request node, per
+# 07-n8n-to-host-communication.md), rather than a separate container.
+#
+# LAYOUT (flat, single folder — everything lives next to this script):
+#   n8nctl              (this file)
+#   n8nctl.env           optional overrides, auto-sourced if present
+#   n8n-data/            docker volume — n8n's persistent state
+#   backups/             timestamped tar.gz snapshots of n8n-data/
+#
+# Usage: ./n8nctl <command> [options]
+# Run './n8nctl help' any time for the full command/flag reference and
+# examples. Any unknown command, unknown flag, or missing flag value
+# prints the same help text automatically — you never have to go
+# looking for it separately.
+# ─────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+# ── Resolve script's own directory (portable — unchanged, hard-won) ──
+SCRIPT_PATH="$0"
+case "$SCRIPT_PATH" in
+  */*) : ;;
+  *)   SCRIPT_PATH="$(command -v -- "$SCRIPT_PATH")" ;;
+esac
+SCRIPT_PATH="$(readlink -f -- "$SCRIPT_PATH")"
+case "$SCRIPT_PATH" in
+  /*) : ;;
+  *)  SCRIPT_PATH="$(pwd)/$SCRIPT_PATH" ;;
+esac
+# FLAT LAYOUT: everything lives beside the script, no "../" — this is
+# the one-folder fix. Previously this was dirname/.. which assumed the
+# script sat in a subfolder (e.g. bin/) with data as a sibling above it.
+PROJECT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# ── Defaults — env vars still work as fallbacks, flags override them ──
+N8N_NAME="${N8N_NAME:-n8n}"
+N8N_IMAGE_BASE="docker.n8n.io/n8nio/n8n"
+N8N_IMAGE_TAG="${N8N_IMAGE_TAG:-latest}"
+N8N_DATA="$PROJECT_DIR/n8n-data"
+BACKUP_DIR="$PROJECT_DIR/backups"
+ENV_FILE="$PROJECT_DIR/n8nctl.env"
+N8N_TZ="${N8N_TZ:-America/Puerto_Rico}"
+N8N_BIND="${N8N_BIND:-127.0.0.1}"
+HOST_ACCESS="${HOST_ACCESS:-true}"
+
+# ── Optional local config file, kept in the same folder ───────────
+# Lets you pin overrides (tz, image tag, name) without editing this
+# script or exporting env vars every session. Never required.
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+
+# ── Colors — only when stdout is a real terminal AND the user hasn't ──
+# opted out via the NO_COLOR convention (https://no-color.org). A
+# fuller palette than before: BOLD/DIM for structure, BLUE for
+# neutral/informational highlights (URLs, paths), MAGENTA for
+# file-path emphasis in backup/restore, on top of the original
+# GREEN/YELLOW/RED/CYAN for success/warn/error/headers.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD=$'\033[1m'
+  DIM=$'\033[2m'
+  GREEN=$'\033[0;32m'
+  YELLOW=$'\033[1;33m'
+  RED=$'\033[0;31m'
+  BLUE=$'\033[0;34m'
+  CYAN=$'\033[0;36m'
+  MAGENTA=$'\033[0;35m'
+  NC=$'\033[0m'
+else
+  BOLD=''; DIM=''; GREEN=''; YELLOW=''; RED=''; BLUE=''; CYAN=''; MAGENTA=''; NC=''
+fi
+info()  { echo -e "${GREEN}[+]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
+error() { echo -e "${RED}[x]${NC} $1"; }
+note()  { echo -e "${BLUE}[*]${NC} $1"; }
+
+# ── Helpers ────────────────────────────────────────────────────
+container_exists()  { docker ps -a --format '{{.Names}}' | grep -qx "$1"; }
+container_running() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
+ensure_dirs()        { mkdir -p "$N8N_DATA" "$BACKUP_DIR"; }
+full_image()         { echo "${N8N_IMAGE_BASE}:${N8N_IMAGE_TAG}"; }
+
+# ── Help — always the same text, shown on request AND on any mistake ──
+cmd_help() {
+  cat << EOF
+${BOLD}${CYAN}n8nctl${NC} — standalone control script for a lone n8n Docker container
+
+${BOLD}${CYAN}FOLDER LAYOUT${NC} (flat — everything lives beside this script)
+  $PROJECT_DIR/
+    n8nctl            this script
+    n8nctl.env        optional overrides (auto-sourced if present)
+    n8n-data/         docker volume — n8n's persistent state
+    backups/          timestamped snapshots of n8n-data/
+
+${BOLD}${CYAN}USAGE${NC}
+  ./n8nctl <command> [options]
+
+${BOLD}${CYAN}COMMANDS${NC}
+  start     Create/start n8n
+  stop      Stop n8n (container preserved)
+  restart   Stop then start
+  update    Pull latest (or --image-tag) and recreate, preserving data
+  status    Show container status
+  config    Show effective settings without starting anything
+  logs      Follow n8n logs
+  shell     Open a shell inside the running container
+  backup    Snapshot n8n-data/ into backups/ (stops container briefly)
+  restore   Restore n8n-data/ from a backup file (overwrites current data)
+  remove    Stop and remove the container (add --data to also wipe data)
+  help      Show this message
+
+${BOLD}${CYAN}OPTIONS${NC} (start / restart / update)
+  -l, --lan               Bind to 0.0.0.0 for LAN access (default: localhost only)
+  -b, --bind <ip>         Bind to a specific address instead of 127.0.0.1
+      --localhost         Force localhost-only — the default, rarely needed explicitly
+  -n, --name <name>       Container name (default: n8n)
+      --no-host-access    Disable the host.docker.internal mapping (default: enabled)
+  -t, --tz <timezone>     Timezone, e.g. America/New_York (default: America/Puerto_Rico)
+  -i, --image-tag <tag>   n8n image tag (default: latest, or N8N_IMAGE_TAG)
+
+${BOLD}${CYAN}OPTIONS${NC} (stop / status / logs / shell / config)
+  -n, --name <name>       Target a container name other than the default "n8n"
+
+${BOLD}${CYAN}OPTIONS${NC} (remove)
+  -n, --name <name>       Target a container name other than the default "n8n"
+      --data              Also delete the n8n-data/ folder (irreversible)
+
+${BOLD}${CYAN}OPTIONS${NC} (restore)
+  -n, --name <name>       Target a container name other than the default "n8n"
+      --file <path>       Backup file to restore (required)
+
+${BOLD}${CYAN}OPTIONS${NC} (any command)
+  -h, --help              Show this message
+
+${BOLD}${CYAN}ENVIRONMENT${NC}
+  NO_COLOR                Set (to any value) to disable all colored output
+
+${BOLD}${CYAN}EXAMPLES${NC}
+  ./n8nctl start                          # localhost only, all defaults
+  ./n8nctl start --lan                    # LAN access, plain HTTP
+  ./n8nctl start -b 192.168.1.50          # bind to one specific address
+  ./n8nctl start --no-host-access         # no host.docker.internal mapping
+  ./n8nctl start -n n8n-test -t America/New_York
+  ./n8nctl update                         # pull latest, keep current settings
+  ./n8nctl update -i 1.68.0               # pin to a specific version
+  ./n8nctl backup                         # snapshot to backups/
+  ./n8nctl restore --file backups/n8n-data_2026-07-16_1200.tar.gz
+  ./n8nctl remove --data                  # nuke container + volume
+  ./n8nctl config
+  ./n8nctl restart --lan                  # re-apply a bind change
+  ./n8nctl stop
+  ./n8nctl status
+  ./n8nctl logs
+  ./n8nctl shell
+  NO_COLOR=1 ./n8nctl status              # disable colors, e.g. for logging
+
+${BOLD}${CYAN}VERIFY HOST ACCESS${NC} (after start, once running)
+  docker exec n8n cat /etc/hosts | grep host.docker.internal
+
+EOF
+}
+
+# Every bad command, bad flag, or missing flag value goes through this —
+# prints the specific problem, then ALWAYS the full help+examples above,
+# then exits non-zero. Never a bare "not found" with no guidance.
+fail() {
+  error "$1"
+  echo ""
+  cmd_help
+  exit 1
+}
+
+# ── Read back an existing container's actual runtime config ───────
+# Used by update/config so you don't have to re-type flags you already
+# used at creation time. Falls back to current defaults if the
+# container doesn't exist yet.
+detect_current_config() {
+  if ! container_exists "$N8N_NAME"; then
+    return 0
+  fi
+  local bind extra_hosts tz image
+  bind="$(docker inspect "$N8N_NAME" \
+    --format '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{.HostIp}}{{end}}{{end}}' \
+    2>/dev/null || echo '')"
+  [ -n "$bind" ] && N8N_BIND="$bind"
+
+  extra_hosts="$(docker inspect "$N8N_NAME" --format '{{json .HostConfig.ExtraHosts}}' 2>/dev/null || echo '')"
+  case "$extra_hosts" in
+    *host.docker.internal:host-gateway*) HOST_ACCESS="true" ;;
+    *) HOST_ACCESS="false" ;;
+  esac
+
+  tz="$(docker inspect "$N8N_NAME" \
+    --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    | grep '^GENERIC_TIMEZONE=' | cut -d= -f2- || echo '')"
+  [ -n "$tz" ] && N8N_TZ="$tz"
+
+  image="$(docker inspect "$N8N_NAME" --format '{{.Config.Image}}' 2>/dev/null || echo '')"
+  case "$image" in
+    */*:*) N8N_IMAGE_TAG="${image##*:}" ;;
+  esac
+}
+
+# ── Flag parsing ───────────────────────────────────────────────
+# Full option set — used by start/restart/update
+parse_start_flags() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -l|--lan)
+        N8N_BIND="0.0.0.0"
+        shift
+        ;;
+      -b|--bind)
+        [ -n "${2:-}" ] || fail "--bind requires an IP address, e.g. --bind 192.168.1.50"
+        N8N_BIND="$2"
+        shift 2
+        ;;
+      --localhost)
+        N8N_BIND="127.0.0.1"
+        shift
+        ;;
+      -n|--name)
+        [ -n "${2:-}" ] || fail "--name requires a value, e.g. --name n8n-test"
+        N8N_NAME="$2"
+        shift 2
+        ;;
+      --no-host-access)
+        HOST_ACCESS="false"
+        shift
+        ;;
+      -t|--tz)
+        [ -n "${2:-}" ] || fail "--tz requires a timezone, e.g. --tz America/New_York"
+        N8N_TZ="$2"
+        shift 2
+        ;;
+      -i|--image-tag)
+        [ -n "${2:-}" ] || fail "--image-tag requires a value, e.g. --image-tag 1.68.0"
+        N8N_IMAGE_TAG="$2"
+        shift 2
+        ;;
+      -h|--help)
+        cmd_help
+        exit 0
+        ;;
+      *)
+        fail "Unknown option for '$COMMAND': $1"
+        ;;
+    esac
+  done
+}
+
+# Reduced option set — used by stop/status/logs/shell/config (just naming + help)
+parse_common_flags() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--name)
+        [ -n "${2:-}" ] || fail "--name requires a value, e.g. --name n8n-test"
+        N8N_NAME="$2"
+        shift 2
+        ;;
+      -h|--help)
+        cmd_help
+        exit 0
+        ;;
+      *)
+        fail "Unknown option: $1"
+        ;;
+    esac
+  done
+}
+
+parse_remove_flags() {
+  DELETE_DATA="false"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--name)
+        [ -n "${2:-}" ] || fail "--name requires a value, e.g. --name n8n-test"
+        N8N_NAME="$2"
+        shift 2
+        ;;
+      --data)
+        DELETE_DATA="true"
+        shift
+        ;;
+      -h|--help)
+        cmd_help
+        exit 0
+        ;;
+      *)
+        fail "Unknown option for 'remove': $1"
+        ;;
+    esac
+  done
+}
+
+parse_restore_flags() {
+  RESTORE_FILE=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--name)
+        [ -n "${2:-}" ] || fail "--name requires a value, e.g. --name n8n-test"
+        N8N_NAME="$2"
+        shift 2
+        ;;
+      --file)
+        [ -n "${2:-}" ] || fail "--file requires a path, e.g. --file backups/n8n-data_....tar.gz"
+        RESTORE_FILE="$2"
+        shift 2
+        ;;
+      -h|--help)
+        cmd_help
+        exit 0
+        ;;
+      *)
+        fail "Unknown option for 'restore': $1"
+        ;;
+    esac
+  done
+  [ -n "$RESTORE_FILE" ] || fail "'restore' requires --file <path to backup>"
+  [ -f "$RESTORE_FILE" ] || fail "Backup file not found: $RESTORE_FILE"
+}
+
+# ── Commands ───────────────────────────────────────────────────
+cmd_start() {
+  ensure_dirs
+
+  local needs_recreate=false
+  if container_exists "$N8N_NAME"; then
+    local current_bind
+    current_bind="$(docker inspect "$N8N_NAME" \
+      --format '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{.HostIp}}{{end}}{{end}}' \
+      2>/dev/null || echo '')"
+    if [ -n "$current_bind" ] && [ "$current_bind" != "$N8N_BIND" ]; then
+      warn "Existing container's bind address ($current_bind) doesn't match requested ($N8N_BIND) — recreating"
+      docker rm -f "$N8N_NAME" > /dev/null
+      needs_recreate=true
+    fi
+  fi
+
+  # Separate check: does the container's actual host-access mapping match
+  # what's currently requested? Docker can't add/remove --add-host on an
+  # existing container ("docker start" just restarts it as-is) — without
+  # this check, toggling --no-host-access, or starting against a container
+  # created before this feature existed, would silently keep the stale
+  # mapping state with no warning at all.
+  if [ "$needs_recreate" = false ] && container_exists "$N8N_NAME"; then
+    local extra_hosts wants_host_access has_host_access
+    extra_hosts="$(docker inspect "$N8N_NAME" --format '{{json .HostConfig.ExtraHosts}}' 2>/dev/null || echo '')"
+    wants_host_access="false"
+    [ "$HOST_ACCESS" = "true" ] && wants_host_access="true"
+    has_host_access="false"
+    case "$extra_hosts" in
+      *host.docker.internal:host-gateway*) has_host_access="true" ;;
+    esac
+    if [ "$wants_host_access" != "$has_host_access" ]; then
+      warn "Existing container's host-access mapping doesn't match requested setting — recreating"
+      docker rm -f "$N8N_NAME" > /dev/null
+      needs_recreate=true
+    fi
+  fi
+
+  if container_running "$N8N_NAME" && [ "$needs_recreate" = false ]; then
+    info "$N8N_NAME is already running"
+  elif container_exists "$N8N_NAME" && [ "$needs_recreate" = false ]; then
+    info "Starting existing $N8N_NAME container"
+    docker start "$N8N_NAME" > /dev/null
+  else
+    info "Creating and starting $N8N_NAME container (${BOLD}$(full_image)${NC})"
+    sudo chown -R 1000:1000 "$N8N_DATA"
+
+    local args=(-d --name "$N8N_NAME" --restart unless-stopped
+      -p "$N8N_BIND:5678:5678"
+      -v "$N8N_DATA:/home/node/.n8n"
+      -e GENERIC_TIMEZONE="$N8N_TZ" -e TZ="$N8N_TZ")
+
+    if [ "$N8N_BIND" != "127.0.0.1" ]; then
+      warn "N8N_BIND=$N8N_BIND — using N8N_SECURE_COOKIE=false since this isn't HTTPS."
+      warn "${BOLD}${RED}This exposes the n8n UI to your LAN${NC} — make sure owner/user auth is set up inside n8n."
+      args+=(-e N8N_SECURE_COOKIE=false)
+    fi
+
+    if [ "$HOST_ACCESS" = "true" ]; then
+      args+=(--add-host=host.docker.internal:host-gateway)
+    fi
+
+    docker run "${args[@]}" "$(full_image)" > /dev/null
+  fi
+
+  echo ""
+  if [ "$N8N_BIND" = "127.0.0.1" ]; then
+    info "n8n UI: ${BOLD}${BLUE}http://localhost:5678${NC}"
+  else
+    info "n8n UI: ${BOLD}${BLUE}http://$N8N_BIND:5678${NC} (or your LAN IP)"
+  fi
+  if [ "$HOST_ACCESS" = "true" ]; then
+    info "Host machine reachable from inside the container at: ${BOLD}host.docker.internal${NC}"
+  else
+    warn "Host access disabled — host.docker.internal will not resolve from inside this container"
+  fi
+
+  wait_for_healthy
+}
+
+# Polls the UI port after start instead of assuming success the moment
+# `docker run`/`docker start` returns — that only means the container
+# object exists, not that n8n finished booting.
+wait_for_healthy() {
+  local host="$N8N_BIND"
+  [ "$host" = "0.0.0.0" ] && host="127.0.0.1"
+  local tries=0
+  echo -n "  waiting for n8n to respond"
+  while [ $tries -lt 30 ]; do
+    if curl -s -o /dev/null -w '' --max-time 1 "http://$host:5678/healthz" 2>/dev/null; then
+      echo ""
+      info "n8n is responding"
+      return 0
+    fi
+    echo -en "${CYAN}.${NC}"
+    sleep 1
+    tries=$((tries + 1))
+  done
+  echo ""
+  warn "n8n didn't respond within 30s — check 'docker logs $N8N_NAME'"
+}
+
+cmd_stop() {
+  if container_running "$N8N_NAME"; then
+    info "Stopping $N8N_NAME"
+    docker stop "$N8N_NAME" > /dev/null
+  else
+    info "$N8N_NAME is not running"
+  fi
+}
+
+cmd_restart() {
+  cmd_stop
+  cmd_start
+}
+
+cmd_update() {
+  detect_current_config
+  info "Pulling ${BOLD}$(full_image)${NC}"
+  docker pull "$(full_image)"
+
+  if container_exists "$N8N_NAME"; then
+    info "Removing old container (data volume preserved)"
+    docker rm -f "$N8N_NAME" > /dev/null
+  fi
+
+  cmd_start
+}
+
+# Colorized, fixed-width status line — deliberately NOT `docker ps -a
+# --format table` piped through awk. That approach sizes column widths
+# from every container on the host before filtering down to just this
+# one, so the header's alignment could shift depending on what else was
+# running. Querying this one container directly and formatting it
+# ourselves keeps the output both colorized and independent of
+# anything else on the host.
+cmd_status() {
+  echo ""
+  printf "${BOLD}%-20s %-22s %s${NC}\n" "NAME" "STATUS" "PORTS"
+
+  if ! container_exists "$N8N_NAME"; then
+    printf "%-20s ${DIM}%-22s${NC}\n" "$N8N_NAME" "not created"
+    echo ""
+    warn "No container named '$N8N_NAME' exists yet — run './n8nctl start'"
+    echo ""
+    return 0
+  fi
+
+  local status ports status_color
+  status="$(docker ps -a --filter "name=^${N8N_NAME}\$" --format '{{.Status}}')"
+  ports="$(docker ps -a --filter "name=^${N8N_NAME}\$" --format '{{.Ports}}')"
+
+  case "$status" in
+    Up*)      status_color="$GREEN" ;;
+    Exited*)  status_color="$RED" ;;
+    Created*) status_color="$YELLOW" ;;
+    *)        status_color="$NC" ;;
+  esac
+
+  printf "%-20s ${status_color}%-22s${NC} %s\n" "$N8N_NAME" "$status" "$ports"
+  echo ""
+}
+
+cmd_config() {
+  detect_current_config
+  echo ""
+  echo -e "${BOLD}${CYAN}Effective configuration for '$N8N_NAME'${NC}"
+
+  local env_status
+  if [ -f "$ENV_FILE" ]; then
+    env_status="${GREEN}found${NC}"
+  else
+    env_status="${DIM}not present${NC}"
+  fi
+  local ha_color
+  [ "$HOST_ACCESS" = "true" ] && ha_color="$GREEN" || ha_color="$YELLOW"
+
+  printf "  %-16s ${BOLD}%s${NC}\n" "project dir" "$PROJECT_DIR"
+  printf "  %-16s ${BOLD}%s${NC}\n" "data dir" "$N8N_DATA"
+  printf "  %-16s ${BOLD}%s${NC}\n" "backups dir" "$BACKUP_DIR"
+  printf "  %-16s ${BOLD}%s${NC} (%s)\n" "env file" "$ENV_FILE" "$env_status"
+  printf "  %-16s ${BOLD}%s${NC}\n" "image" "$(full_image)"
+  printf "  %-16s ${BOLD}%s${NC}\n" "bind" "$N8N_BIND"
+  printf "  %-16s ${BOLD}%s${NC}\n" "timezone" "$N8N_TZ"
+  printf "  %-16s ${ha_color}%s${NC}\n" "host access" "$HOST_ACCESS"
+  echo ""
+}
+
+cmd_logs() {
+  docker logs -f "$N8N_NAME"
+}
+
+cmd_shell() {
+  container_running "$N8N_NAME" || fail "$N8N_NAME is not running — start it first"
+  note "Opening a shell inside $N8N_NAME — 'exit' to leave"
+  docker exec -it "$N8N_NAME" sh
+}
+
+cmd_backup() {
+  ensure_dirs
+  local was_running=false
+  if container_running "$N8N_NAME"; then
+    was_running=true
+    info "Stopping $N8N_NAME for a consistent backup"
+    docker stop "$N8N_NAME" > /dev/null
+  fi
+
+  local ts backup_file
+  ts="$(date +%Y-%m-%d_%H%M%S)"
+  backup_file="$BACKUP_DIR/n8n-data_${ts}.tar.gz"
+  info "Archiving ${MAGENTA}$N8N_DATA${NC} -> ${MAGENTA}$backup_file${NC}"
+  tar -czf "$backup_file" -C "$(dirname "$N8N_DATA")" "$(basename "$N8N_DATA")"
+  info "Backup complete: ${BOLD}${MAGENTA}$backup_file${NC}"
+
+  if [ "$was_running" = true ]; then
+    info "Restarting $N8N_NAME"
+    docker start "$N8N_NAME" > /dev/null
+    wait_for_healthy
+  fi
+}
+
+cmd_restore() {
+  local was_running=false
+  if container_running "$N8N_NAME"; then
+    was_running=true
+    warn "Stopping $N8N_NAME to restore data"
+    docker stop "$N8N_NAME" > /dev/null
+  fi
+
+  warn "This will overwrite the current contents of ${MAGENTA}$N8N_DATA${NC}"
+  read -r -p "  type 'yes' to continue: " confirm
+  [ "$confirm" = "yes" ] || { info "Restore cancelled"; exit 0; }
+
+  rm -rf "${N8N_DATA:?}"/*
+  tar -xzf "$RESTORE_FILE" -C "$(dirname "$N8N_DATA")"
+  sudo chown -R 1000:1000 "$N8N_DATA"
+  info "Restore complete from ${BOLD}${MAGENTA}$RESTORE_FILE${NC}"
+
+  if [ "$was_running" = true ]; then
+    info "Restarting $N8N_NAME"
+    docker start "$N8N_NAME" > /dev/null
+    wait_for_healthy
+  fi
+}
+
+cmd_remove() {
+  if container_exists "$N8N_NAME"; then
+    info "Removing container $N8N_NAME"
+    docker rm -f "$N8N_NAME" > /dev/null
+  else
+    info "No container named $N8N_NAME to remove"
+  fi
+
+  if [ "$DELETE_DATA" = "true" ]; then
+    warn "${BOLD}${RED}This will permanently delete $N8N_DATA${NC}"
+    read -r -p "  type 'yes' to continue: " confirm
+    if [ "$confirm" = "yes" ]; then
+      rm -rf "$N8N_DATA"
+      info "Deleted $N8N_DATA"
+    else
+      info "Data directory left in place"
+    fi
+  fi
+}
+
+# ── Dispatch ───────────────────────────────────────────────────
+COMMAND="${1:-help}"
+[ $# -gt 0 ] && shift
+
+case "$COMMAND" in
+  start)
+    parse_start_flags "$@"
+    cmd_start
+    ;;
+  restart)
+    parse_start_flags "$@"
+    cmd_restart
+    ;;
+  update)
+    parse_start_flags "$@"
+    cmd_update
+    ;;
+  stop)
+    parse_common_flags "$@"
+    cmd_stop
+    ;;
+  status)
+    parse_common_flags "$@"
+    cmd_status
+    ;;
+  config)
+    parse_common_flags "$@"
+    cmd_config
+    ;;
+  logs)
+    parse_common_flags "$@"
+    cmd_logs
+    ;;
+  shell)
+    parse_common_flags "$@"
+    cmd_shell
+    ;;
+  backup)
+    parse_common_flags "$@"
+    cmd_backup
+    ;;
+  restore)
+    parse_restore_flags "$@"
+    cmd_restore
+    ;;
+  remove)
+    parse_remove_flags "$@"
+    cmd_remove
+    ;;
+  help|-h|--help)
+    cmd_help
+    ;;
+  *)
+    fail "Unknown command: $COMMAND"
+    ;;
+esac
